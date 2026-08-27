@@ -70,11 +70,13 @@ itself.
 
 ## What stops this from being a rubber stamp
 
-- **Real artifact fetching, not self-report.** `gl.nondet.web.render`
-  pulls the actual live page; if the fetch fails, the contract falls
-  back to judging the freelancer's description alone rather than
-  hard-failing, and says so plainly in the prompt so the LLM discounts
-  accordingly.
+- **Live evidence is mandatory, not optional.** `gl.nondet.web.render`
+  pulls the actual live page for any verdict that can eventually release
+  or refund funds. If no URL was submitted, or the fetch fails, the
+  contract never asks the model to settle the milestone from the
+  freelancer's self-reported description alone — it fails closed to
+  `rejected` (in `review_milestone`) or `refunded` (in
+  `resolve_dispute`) without invoking the model at all.
 - **A contract-verifiable clock.** All time windows (`refund_delay_seconds`,
   `dispute_evidence_window_seconds`, `approval_challenge_window_seconds`)
   are measured against `gl.vm.get_timestamp()` — the transaction's own
@@ -129,11 +131,13 @@ cancellation.
 
 ## Tests
 
-`tests/test.py` — 37 tests covering: deployment validation (milestone
+`tests/test.py` — 35 tests covering: deployment validation (milestone
 count, window requirements), funding (exact-amount, buyer-only,
 double-fund rejection, paused-registry blocking, registry sync), fee
 lockup and admin controls, milestone submission and independence, the
-full approve → claim → double-claim-rejected flow, the full dispute flow
+mandatory-live-evidence fail-closed rule (missing URL and unfetchable
+URL, in both `review_milestone` and `resolve_dispute`), the full
+approve → claim → double-claim-rejected flow, the full dispute flow
 (evidence windows, resolution, status transitions), the approval
 challenge window (including its expiry), mutual cancellation, and timed
 refunds (including respecting the delay and only applying pre-submission).
