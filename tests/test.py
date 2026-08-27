@@ -29,6 +29,13 @@ MILESTONE_2 = "Implement the homepage in responsive HTML/CSS matching the approv
 AMOUNT_1 = "500000000000000000"   # 0.5 GEN
 AMOUNT_2 = "1000000000000000000"  # 1.0 GEN
 
+# A real, stable, publicly-fetchable page used for tests that exercise the
+# live-evidence path. An unreachable host is used to deterministically
+# exercise the "fetch failed" fail-closed path.
+LIVE_URL = "https://example.com"
+LIVE_URL_MILESTONE = "Deliver a live, publicly reachable page that can be verified by fetching its content."
+UNFETCHABLE_URL = "https://this-host-does-not-exist.escrowcourt-test.invalid"
+
 # Small-but-real windows so tests can cross them with an actual time.sleep()
 # instead of a spoofable caller-supplied timestamp (that spoofing is exactly
 # what these fixes remove from the contract).
@@ -374,10 +381,59 @@ def test_review_requires_submitted_status(registry_address, buyer, freelancer):
     assert not has_success_status(response)
 
 
-def test_full_approval_flow_and_payment(registry_address, buyer, freelancer):
-    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Good delivery", [MILESTONE_1], [AMOUNT_1])
+def test_review_without_url_fails_closed(registry_address, buyer, freelancer):
+    """No live deliverable evidence is available at all, so the verdict must
+    fail closed to 'rejected' without ever asking the model to settle it
+    from the freelancer's self-reported description alone."""
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "No URL submitted", [MILESTONE_1], [AMOUNT_1])
     send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
     send_transaction(freelancer, deal_address, "submit_milestone", [0, "", "Delivered a Figma wireframe covering hero, features, and footer sections as requested."])
+    send_transaction(freelancer, deal_address, "review_milestone", [0])
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "rejected"
+
+
+def test_review_with_unfetchable_url_fails_closed(registry_address, buyer, freelancer):
+    """A URL that cannot be fetched is treated the same as no evidence at
+    all: fail closed to 'rejected' rather than falling back to judging the
+    description alone."""
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Unfetchable URL", [MILESTONE_1], [AMOUNT_1])
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+    send_transaction(freelancer, deal_address, "submit_milestone", [0, UNFETCHABLE_URL, "Delivered the wireframe at the link above."])
+    send_transaction(freelancer, deal_address, "review_milestone", [0])
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "rejected"
+
+
+def test_dispute_without_url_fails_closed_to_refund(registry_address, buyer, freelancer):
+    """resolve_dispute is a final, fund-moving verdict, so it carries the
+    same mandatory-live-evidence rule: no URL at dispute time means no
+    verifiable evidence, so it fails closed to 'refunded'."""
+    deal_address = deploy_deal(
+        buyer, registry_address, freelancer.address, "Dispute without URL",
+        [MILESTONE_1], [AMOUNT_1],
+    )
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+    send_transaction(freelancer, deal_address, "submit_milestone", [0, "", "Delivered the wireframe as described."])
+    send_transaction(freelancer, deal_address, "review_milestone", [0])  # fails closed to "rejected"
+
+    send_transaction(buyer, deal_address, "submit_dispute_evidence", [0, "I don't believe this was ever delivered."])
+    send_transaction(freelancer, deal_address, "submit_dispute_evidence", [0, "I delivered it, just trust my description."])
+
+    time.sleep(DEFAULT_EVIDENCE_WINDOW + 1)
+    response = send_transaction(freelancer, deal_address, "resolve_dispute", [0])
+    assert has_success_status(response)
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "refund_claimed"
+
+
+def test_full_approval_flow_and_payment(registry_address, buyer, freelancer):
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Good delivery", [LIVE_URL_MILESTONE], [AMOUNT_1])
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+    send_transaction(freelancer, deal_address, "submit_milestone", [0, LIVE_URL, "The page is live at the submitted URL and reachable by anyone."])
     send_transaction(freelancer, deal_address, "review_milestone", [0])
 
     details = get_details(deal_address, buyer)
@@ -410,11 +466,105 @@ def test_claim_payment_requires_approved_status(registry_address, buyer, freelan
 
 
 def test_only_freelancer_can_claim_payment(registry_address, buyer, freelancer):
-    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Wrong claimer", [MILESTONE_1], [AMOUNT_1])
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Wrong claimer", [LIVE_URL_MILESTONE], [AMOUNT_1])
     send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
-    send_transaction(freelancer, deal_address, "submit_milestone", [0, "", "Delivered a Figma wireframe covering hero, features, and footer sections as requested."])
+    send_transaction(freelancer, deal_address, "submit_milestone", [0, LIVE_URL, "The page is live at the submitted URL and reachable by anyone."])
     send_transaction(freelancer, deal_address, "review_milestone", [0])
 
     details = get_details(deal_address, buyer)
     if details["milestones"][0]["status"] != "approved":
-        pytest.skip("Model did not approve this delivery in this run; claimer-gu
+        pytest.skip("Model did not approve this delivery in this run; claimer-guard path not exercised")
+
+    time.sleep(DEFAULT_CHALLENGE_WINDOW + 1)
+    wrong_claimer = send_transaction(buyer, deal_address, "claim_payment", [0])
+    assert not has_success_status(wrong_claimer)
+
+    right_claimer = send_transaction(freelancer, deal_address, "claim_payment", [0])
+    assert has_success_status(right_claimer)
+
+
+# ---------------------------------------------------------------------------
+# Approval challenge window
+# ---------------------------------------------------------------------------
+
+def test_challenge_approved_milestone_reopens_dispute(registry_address, buyer, freelancer):
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Challenge test", [LIVE_URL_MILESTONE], [AMOUNT_1])
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+    send_transaction(freelancer, deal_address, "submit_milestone", [0, LIVE_URL, "The page is live at the submitted URL and reachable by anyone."])
+    send_transaction(freelancer, deal_address, "review_milestone", [0])
+
+    details = get_details(deal_address, buyer)
+    if details["milestones"][0]["status"] != "approved":
+        pytest.skip("Model did not approve this delivery in this run; challenge path not exercised")
+
+    response = send_transaction(buyer, deal_address, "challenge_approved_milestone", [0])
+    assert has_success_status(response)
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "rejected"
+
+
+def test_challenge_window_expires(registry_address, buyer, freelancer):
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Expired challenge", [LIVE_URL_MILESTONE], [AMOUNT_1])
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+    send_transaction(freelancer, deal_address, "submit_milestone", [0, LIVE_URL, "The page is live at the submitted URL and reachable by anyone."])
+    send_transaction(freelancer, deal_address, "review_milestone", [0])
+
+    details = get_details(deal_address, buyer)
+    if details["milestones"][0]["status"] != "approved":
+        pytest.skip("Model did not approve this delivery in this run; challenge-expiry path not exercised")
+
+    time.sleep(DEFAULT_CHALLENGE_WINDOW + 1)
+    late_challenge = send_transaction(buyer, deal_address, "challenge_approved_milestone", [0])
+    assert not has_success_status(late_challenge)
+
+
+# ---------------------------------------------------------------------------
+# Mutual cancellation
+# ---------------------------------------------------------------------------
+
+def test_propose_cancel_requires_both_parties(registry_address, buyer, freelancer):
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "Mutual cancel", [MILESTONE_1], [AMOUNT_1])
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+
+    buyer_vote = send_transaction(buyer, deal_address, "propose_cancel", [0])
+    assert has_success_status(buyer_vote)
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "pending"  # only one side has voted so far
+
+    freelancer_vote = send_transaction(freelancer, deal_address, "propose_cancel", [0])
+    assert has_success_status(freelancer_vote)
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "refund_claimed"
+
+
+# ---------------------------------------------------------------------------
+# Timed refunds
+# ---------------------------------------------------------------------------
+
+def test_claim_timeout_refund_disabled_by_default(registry_address, buyer, freelancer):
+    deal_address = deploy_deal(buyer, registry_address, freelancer.address, "No timeout refund", [MILESTONE_1], [AMOUNT_1])
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+    response = send_transaction(buyer, deal_address, "claim_timeout_refund", [0])
+    assert not has_success_status(response)
+
+
+def test_claim_timeout_refund_flow(registry_address, buyer, freelancer):
+    deal_address = deploy_deal(
+        buyer, registry_address, freelancer.address, "Timeout refund",
+        [MILESTONE_1], [AMOUNT_1], refund_enabled=True, refund_delay_seconds=2,
+    )
+    send_transaction(buyer, deal_address, "fund_escrow", [], value=int(AMOUNT_1))
+
+    too_early = send_transaction(buyer, deal_address, "claim_timeout_refund", [0])
+    assert not has_success_status(too_early)
+
+    time.sleep(3)
+    response = send_transaction(buyer, deal_address, "claim_timeout_refund", [0])
+    assert has_success_status(response)
+
+    details = get_details(deal_address, buyer)
+    assert details["milestones"][0]["status"] == "refund_claimed"
+
